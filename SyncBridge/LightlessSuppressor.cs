@@ -62,16 +62,6 @@ internal sealed class LightlessSuppressor : IDisposable
                 if (pairHandlerType == null)
                     continue;
 
-                var targetMethods = pairHandlerType
-                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(method =>
-                        method.Name == "ApplyCharacterDataAsync" &&
-                        method.ReturnType == typeof(Task))
-                    .ToArray();
-
-                if (targetMethods.Length == 0)
-                    continue;
-
                 playerCharacterProperty = pairHandlerType.GetProperty(
                     "PlayerCharacter",
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -80,31 +70,60 @@ internal sealed class LightlessSuppressor : IDisposable
                 {
                     log.Information(
                         "Found Lightless PairHandler in {Assembly}, but PlayerCharacter was not found.",
-                        assembly.GetName().Name);
+                        assembly.GetName().Name ?? "unknown");
                     continue;
                 }
 
                 harmony ??= new Harmony(HarmonyId);
 
-                var prefixMethod = typeof(LightlessSuppressor).GetMethod(
-                    nameof(ApplyCharacterDataPrefix),
-                    BindingFlags.Static | BindingFlags.NonPublic);
+                var installed = 0;
 
-                if (prefixMethod == null)
+                // Current Lightless: public void ApplyCharacterData(...)
+                foreach (var method in pairHandlerType
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Where(method => method.Name == "ApplyCharacterData" && method.ReturnType == typeof(void)))
                 {
-                    log.Error("Could not find SyncBridge Lightless prefix method.");
-                    return;
+                    var prefix = typeof(LightlessSuppressor).GetMethod(
+                        nameof(ApplyCharacterDataPrefix),
+                        BindingFlags.Static | BindingFlags.NonPublic);
+
+                    if (prefix != null)
+                    {
+                        harmony.Patch(method, prefix: new HarmonyMethod(prefix));
+                        installed++;
+                    }
                 }
 
-                foreach (var targetMethod in targetMethods)
-                    harmony.Patch(targetMethod, prefix: new HarmonyMethod(prefixMethod));
+                // Compatibility with older/forked Lightless builds.
+                foreach (var method in pairHandlerType
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Where(method => method.Name == "ApplyCharacterDataAsync" && method.ReturnType == typeof(Task)))
+                {
+                    var prefix = typeof(LightlessSuppressor).GetMethod(
+                        nameof(ApplyCharacterDataAsyncPrefix),
+                        BindingFlags.Static | BindingFlags.NonPublic);
 
-                patchedMethodCount = targetMethods.Length;
+                    if (prefix != null)
+                    {
+                        harmony.Patch(method, prefix: new HarmonyMethod(prefix));
+                        installed++;
+                    }
+                }
+
+                if (installed == 0)
+                {
+                    log.Information(
+                        "Found Lightless PairHandler in {Assembly}, but no supported ApplyCharacterData method was found.",
+                        assembly.GetName().Name ?? "unknown");
+                    continue;
+                }
+
+                patchedMethodCount = installed;
 
                 log.Information(
-                    "SyncBridge suppression ACTIVE: hooked {Count} Lightless ApplyCharacterDataAsync method(s) in {Assembly}.",
+                    "SyncBridge suppression ACTIVE: hooked {Count} Lightless character-apply method(s) in {Assembly}.",
                     patchedMethodCount,
-                    assembly.GetName().Name);
+                    assembly.GetName().Name ?? "unknown");
 
                 return;
             }
@@ -118,29 +137,45 @@ internal sealed class LightlessSuppressor : IDisposable
         }
     }
 
-    private static bool ApplyCharacterDataPrefix(object __instance, ref Task __result)
+    // Current Lightless void entry point.
+    private static bool ApplyCharacterDataPrefix(object __instance)
+    {
+        if (!ShouldSuppressInstance(__instance))
+            return true;
+
+        Interlocked.Increment(ref suppressedApplications);
+        return false;
+    }
+
+    // Older/forked async entry point.
+    private static bool ApplyCharacterDataAsyncPrefix(object __instance, ref Task __result)
+    {
+        if (!ShouldSuppressInstance(__instance))
+            return true;
+
+        __result = Task.CompletedTask;
+        Interlocked.Increment(ref suppressedApplications);
+        return false;
+    }
+
+    private static bool ShouldSuppressInstance(object instance)
     {
         try
         {
             var property = playerCharacterProperty
-                ?? __instance.GetType().GetProperty(
+                ?? instance.GetType().GetProperty(
                     "PlayerCharacter",
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
-            if (property?.GetValue(__instance) is not IntPtr address || address == IntPtr.Zero)
-                return true;
+            if (property?.GetValue(instance) is not IntPtr address || address == IntPtr.Zero)
+                return false;
 
-            if (!IsPlayerSyncOwned(address))
-                return true;
-
-            __result = Task.CompletedTask;
-            Interlocked.Increment(ref suppressedApplications);
-            return false;
+            return IsPlayerSyncOwned(address);
         }
         catch
         {
-            // Fail open: if Lightless changes, allow Lightless to continue normally.
-            return true;
+            // Fail open: if Lightless changes, let it continue normally.
+            return false;
         }
     }
 
@@ -177,13 +212,17 @@ internal sealed class LightlessSuppressor : IDisposable
             if (!string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
                 continue;
 
-            var hasTarget = type
+            var ns = type.Namespace ?? string.Empty;
+            if (!ns.Contains("Lightless", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var hasApplyMethod = type
                 .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                 .Any(method =>
-                    method.Name == "ApplyCharacterDataAsync" &&
-                    method.ReturnType == typeof(Task));
+                    method.Name == "ApplyCharacterData" ||
+                    method.Name == "ApplyCharacterDataAsync");
 
-            if (hasTarget)
+            if (hasApplyMethod)
                 return type;
         }
 

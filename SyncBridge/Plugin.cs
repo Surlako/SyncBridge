@@ -20,7 +20,6 @@ public sealed class Plugin : IDalamudPlugin
     public Plugin()
     {
         coordinator = new SyncCoordinator(PluginInterface, Log);
-
         Framework.Update += OnFrameworkUpdate;
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
@@ -44,7 +43,8 @@ public sealed class Plugin : IDalamudPlugin
             $"PlayerSync: {state.PlayerSyncHandled.Count} | " +
             $"Lightless: {state.LightlessHandled.Count} | " +
             $"Overlap: {state.Overlap.Count} | " +
-            $"Suppression: {(coordinator.Suppressor.IsOperational ? "ACTIVE" : "NOT IMPLEMENTED")}";
+            $"Suppression: {(coordinator.Suppressor.IsOperational ? "ACTIVE" : "INACTIVE")} | " +
+            $"Blocked applies: {coordinator.Suppressor.SuppressedApplications}";
 
         Log.Information(message);
         ChatGui.Print(message);
@@ -54,7 +54,6 @@ public sealed class Plugin : IDalamudPlugin
     {
         Framework.Update -= OnFrameworkUpdate;
         CommandManager.RemoveHandler(CommandName);
-
         coordinator.Dispose();
     }
 }
