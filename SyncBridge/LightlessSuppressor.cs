@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Reflection;
+using System.Runtime.Loader;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
@@ -10,20 +11,24 @@ namespace SyncBridge;
 internal sealed class LightlessSuppressor : IDisposable
 {
     private const string HarmonyId = "Surlako.SyncBridge.LightlessSuppressor";
+    private const string ExactPairHandlerName = "LightlessSync.PlayerData.Handlers.PairHandler";
 
     private static readonly object OwnershipLock = new();
+    private static readonly object PropertyLock = new();
+    private static readonly Dictionary<Type, PropertyInfo> PlayerCharacterProperties = [];
     private static HashSet<nint> playerSyncOwned = [];
-    private static PropertyInfo? playerCharacterProperty;
     private static int suppressedApplications;
 
     private readonly IPluginLog log;
+    private readonly HashSet<MethodBase> patchedMethods = [];
     private Harmony? harmony;
     private DateTime nextPatchAttemptUtc = DateTime.MinValue;
     private bool disposed;
-    private int patchedMethodCount;
+    private string diagnosticReason = "suppression hook has not been attempted";
 
-    public bool IsOperational => patchedMethodCount > 0;
+    public bool IsOperational => patchedMethods.Count > 0;
     public int SuppressedApplications => Volatile.Read(ref suppressedApplications);
+    public string DiagnosticReason => diagnosticReason;
 
     public LightlessSuppressor(IPluginLog log)
     {
@@ -56,88 +61,111 @@ internal sealed class LightlessSuppressor : IDisposable
 
         try
         {
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies().Where(IsLightlessAssembly))
-            {
-                var pairHandlerType = FindPairHandlerType(assembly);
-                if (pairHandlerType == null)
-                    continue;
+            var assemblies = GetLoadedAssemblies().ToArray();
+            var lightlessAssemblies = assemblies.Where(IsLightlessAssembly).ToArray();
 
-                playerCharacterProperty = pairHandlerType.GetProperty(
+            if (lightlessAssemblies.Length == 0)
+            {
+                SetInactiveReason("no Lightless assembly found");
+                return;
+            }
+
+            var pairHandlerTypes = FindPairHandlerTypes(lightlessAssemblies).ToArray();
+            if (pairHandlerTypes.Length == 0)
+            {
+                SetInactiveReason("Lightless assembly found but PairHandler missing");
+                return;
+            }
+
+            var foundPlayerCharacter = false;
+            var foundSupportedMethod = false;
+            var hookErrors = new List<Exception>();
+
+            harmony ??= new Harmony(HarmonyId);
+
+            foreach (var pairHandlerType in pairHandlerTypes)
+            {
+                var playerCharacterProperty = pairHandlerType.GetProperty(
                     "PlayerCharacter",
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
                 if (playerCharacterProperty == null)
-                {
-                    log.Information(
-                        "Found Lightless PairHandler in {Assembly}, but PlayerCharacter was not found.",
-                        assembly.GetName().Name ?? "unknown");
                     continue;
-                }
 
-                harmony ??= new Harmony(HarmonyId);
+                foundPlayerCharacter = true;
 
-                var installed = 0;
+                lock (PropertyLock)
+                    PlayerCharacterProperties[pairHandlerType] = playerCharacterProperty;
 
-                // Current Lightless: public void ApplyCharacterData(...)
-                foreach (var method in pairHandlerType
-                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(method => method.Name == "ApplyCharacterData" && method.ReturnType == typeof(void)))
+                foreach (var method in GetSupportedApplyMethods(pairHandlerType))
                 {
-                    var prefix = typeof(LightlessSuppressor).GetMethod(
-                        nameof(ApplyCharacterDataPrefix),
-                        BindingFlags.Static | BindingFlags.NonPublic);
+                    foundSupportedMethod = true;
 
-                    if (prefix != null)
+                    if (patchedMethods.Contains(method) || IsAlreadyPatchedByUs(method))
                     {
+                        patchedMethods.Add(method);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var prefixName = method.ReturnType == typeof(void)
+                            ? nameof(ApplyCharacterDataPrefix)
+                            : nameof(ApplyCharacterDataAsyncPrefix);
+
+                        var prefix = typeof(LightlessSuppressor).GetMethod(
+                            prefixName,
+                            BindingFlags.Static | BindingFlags.NonPublic)
+                            ?? throw new MissingMethodException(typeof(LightlessSuppressor).FullName, prefixName);
+
                         harmony.Patch(method, prefix: new HarmonyMethod(prefix));
-                        installed++;
+                        patchedMethods.Add(method);
+                    }
+                    catch (Exception ex)
+                    {
+                        hookErrors.Add(ex);
+                        log.Error(
+                            ex,
+                            "Failed to hook {Type}.{Method}.",
+                            pairHandlerType.FullName ?? pairHandlerType.Name,
+                            method.Name);
                     }
                 }
+            }
 
-                // Compatibility with older/forked Lightless builds.
-                foreach (var method in pairHandlerType
-                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(method => method.Name == "ApplyCharacterDataAsync" && method.ReturnType == typeof(Task)))
-                {
-                    var prefix = typeof(LightlessSuppressor).GetMethod(
-                        nameof(ApplyCharacterDataAsyncPrefix),
-                        BindingFlags.Static | BindingFlags.NonPublic);
-
-                    if (prefix != null)
-                    {
-                        harmony.Patch(method, prefix: new HarmonyMethod(prefix));
-                        installed++;
-                    }
-                }
-
-                if (installed == 0)
-                {
-                    log.Information(
-                        "Found Lightless PairHandler in {Assembly}, but no supported ApplyCharacterData method was found.",
-                        assembly.GetName().Name ?? "unknown");
-                    continue;
-                }
-
-                patchedMethodCount = installed;
-
-                log.Information(
-                    "SyncBridge suppression ACTIVE: hooked {Count} Lightless character-apply method(s) in {Assembly}.",
-                    patchedMethodCount,
-                    assembly.GetName().Name ?? "unknown");
-
+            if (patchedMethods.Count > 0)
+            {
+                diagnosticReason = $"hooked {patchedMethods.Count} Lightless character-apply method(s)";
+                log.Information("SyncBridge suppression ACTIVE: {Reason}.", diagnosticReason);
                 return;
             }
 
-            log.Debug("Lightless PairHandler is not loaded yet; SyncBridge will retry.");
+            if (!foundPlayerCharacter)
+                SetInactiveReason("PairHandler found but PlayerCharacter missing");
+            else if (!foundSupportedMethod)
+                SetInactiveReason("PairHandler found but no supported apply method");
+            else
+                SetInactiveReason($"hook error: {hookErrors.FirstOrDefault()?.GetBaseException().Message ?? "unknown error"}");
         }
         catch (Exception ex)
         {
-            patchedMethodCount = 0;
+            SetInactiveReason($"hook error: {ex.GetBaseException().Message}");
             log.Error(ex, "Failed to install the Lightless suppression hook.");
         }
     }
 
-    // Current Lightless void entry point.
+    private void SetInactiveReason(string reason)
+    {
+        diagnosticReason = reason;
+        log.Debug("SyncBridge suppression INACTIVE: {Reason}; will retry.", reason);
+    }
+
+    private static bool IsAlreadyPatchedByUs(MethodBase method)
+    {
+        var patchInfo = Harmony.GetPatchInfo(method);
+        return patchInfo?.Owners.Contains(HarmonyId) == true;
+    }
+
     private static bool ApplyCharacterDataPrefix(object __instance)
     {
         if (!ShouldSuppressInstance(__instance))
@@ -147,7 +175,6 @@ internal sealed class LightlessSuppressor : IDisposable
         return false;
     }
 
-    // Older/forked async entry point.
     private static bool ApplyCharacterDataAsyncPrefix(object __instance, ref Task __result)
     {
         if (!ShouldSuppressInstance(__instance))
@@ -162,10 +189,15 @@ internal sealed class LightlessSuppressor : IDisposable
     {
         try
         {
-            var property = playerCharacterProperty
-                ?? instance.GetType().GetProperty(
-                    "PlayerCharacter",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var instanceType = instance.GetType();
+            PropertyInfo? property;
+
+            lock (PropertyLock)
+                PlayerCharacterProperties.TryGetValue(instanceType, out property);
+
+            property ??= instanceType.GetProperty(
+                "PlayerCharacter",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
             if (property?.GetValue(instance) is not IntPtr address || address == IntPtr.Zero)
                 return false;
@@ -188,6 +220,36 @@ internal sealed class LightlessSuppressor : IDisposable
             return playerSyncOwned.Contains(gameObjectAddress);
     }
 
+    private static IEnumerable<Assembly> GetLoadedAssemblies()
+    {
+        var seen = new HashSet<Assembly>(ReferenceEqualityComparer.Instance);
+
+        foreach (var loadContext in AssemblyLoadContext.All)
+        {
+            IEnumerable<Assembly> assemblies;
+            try
+            {
+                assemblies = loadContext.Assemblies.ToArray();
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var assembly in assemblies)
+            {
+                if (seen.Add(assembly))
+                    yield return assembly;
+            }
+        }
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (seen.Add(assembly))
+                yield return assembly;
+        }
+    }
+
     private static bool IsLightlessAssembly(Assembly assembly)
     {
         var assemblyName = assembly.GetName().Name ?? string.Empty;
@@ -205,28 +267,36 @@ internal sealed class LightlessSuppressor : IDisposable
         }
     }
 
-    private static Type? FindPairHandlerType(Assembly assembly)
+    private static IEnumerable<Type> FindPairHandlerTypes(IEnumerable<Assembly> assemblies)
     {
-        foreach (var type in GetLoadableTypes(assembly))
+        var allTypes = assemblies.SelectMany(GetLoadableTypes).ToArray();
+        var exactTypes = allTypes
+            .Where(type => string.Equals(type.FullName, ExactPairHandlerName, StringComparison.Ordinal))
+            .ToArray();
+
+        foreach (var type in exactTypes)
+            yield return type;
+
+        foreach (var type in allTypes)
         {
-            if (!string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
+            if (exactTypes.Contains(type) || !string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
                 continue;
 
-            var ns = type.Namespace ?? string.Empty;
-            if (!ns.Contains("Lightless", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            var hasApplyMethod = type
-                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                .Any(method =>
-                    method.Name == "ApplyCharacterData" ||
-                    method.Name == "ApplyCharacterDataAsync");
-
-            if (hasApplyMethod)
-                return type;
+            var assemblyName = type.Assembly.GetName().Name ?? string.Empty;
+            var typeNamespace = type.Namespace ?? string.Empty;
+            if (assemblyName.Contains("Lightless", StringComparison.OrdinalIgnoreCase) ||
+                typeNamespace.Contains("Lightless", StringComparison.OrdinalIgnoreCase))
+                yield return type;
         }
+    }
 
-        return null;
+    private static IEnumerable<MethodInfo> GetSupportedApplyMethods(Type pairHandlerType)
+    {
+        return pairHandlerType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(method =>
+                (method.Name == "ApplyCharacterData" && method.ReturnType == typeof(void)) ||
+                (method.Name == "ApplyCharacterDataAsync" && method.ReturnType == typeof(Task)));
     }
 
     private static IEnumerable<Type> GetLoadableTypes(Assembly assembly)
@@ -261,8 +331,11 @@ internal sealed class LightlessSuppressor : IDisposable
             log.Error(ex, "Failed to remove SyncBridge Harmony patches during shutdown.");
         }
 
-        patchedMethodCount = 0;
-        playerCharacterProperty = null;
+        patchedMethods.Clear();
+        diagnosticReason = "disposed";
+
+        lock (PropertyLock)
+            PlayerCharacterProperties.Clear();
 
         lock (OwnershipLock)
             playerSyncOwned.Clear();

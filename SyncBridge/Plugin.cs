@@ -46,6 +46,9 @@ public sealed class Plugin : IDalamudPlugin
             $"Suppression: {(coordinator.Suppressor.IsOperational ? "ACTIVE" : "INACTIVE")} | " +
             $"Blocked applies: {coordinator.Suppressor.SuppressedApplications}";
 
+        if (!coordinator.Suppressor.IsOperational)
+            message += $" | Reason: {coordinator.Suppressor.DiagnosticReason}";
+
         Log.Information(message);
         ChatGui.Print(message);
     }
