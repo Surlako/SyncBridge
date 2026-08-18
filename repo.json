@@ -5,7 +5,7 @@
     "Punchline": "Prefer PlayerSync and use Lightless as a fallback.",
     "Description": "Coordinates PlayerSync and Lightless to avoid duplicate handling of the same on-screen character. /syncbridge",
     "InternalName": "SyncBridge",
-    "AssemblyVersion": "0.1.0.0",
+    "AssemblyVersion": "0.2.0.0",
     "RepoUrl": "https://github.com/Surlako/SyncBridge",
     "ApplicableVersion": "any",
     "Tags": [
