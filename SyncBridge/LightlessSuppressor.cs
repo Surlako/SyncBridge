@@ -215,7 +215,7 @@ internal sealed class LightlessSuppressor : IDisposable
 
         try
         {
-            harmony?.UnpatchSelf();
+            harmony?.UnpatchAll(HarmonyId);
         }
         catch (Exception ex)
         {
