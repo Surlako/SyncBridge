@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.suo
+*.user
+*.csproj.user
+
+# Only the repository-root package is published to Dalamud.
+SyncBridge/latest.zip

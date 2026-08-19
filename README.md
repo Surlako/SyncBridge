@@ -1,6 +1,6 @@
 # SyncBridge
 
-A Dalamud plugin project intended to make **PlayerSync the preferred sync provider** and **Lightless the fallback** when both services are running.
+A Dalamud plugin that makes **PlayerSync the preferred sync provider** and **Lightless the fallback** when both services are running.
 
 ## Intended behavior
 
@@ -11,24 +11,22 @@ A Dalamud plugin project intended to make **PlayerSync the preferred sync provid
 
 ## Current state
 
-### Implemented
-- Reads `PlayerSync.GetHandledAddresses`.
-- Reads `LightlessSync.GetHandledAddresses`.
-- Tracks overlap between the two services.
-- Polls at 250 ms intervals.
-- `/syncbridge` displays current counts.
-- Isolated suppression component ready for the Lightless interception layer.
+- Reads `PlayerSync.GetHandledAddresses` and `LightlessSync.GetHandledAddresses`.
+- Tracks overlap between the two services at 250 ms intervals.
+- Hooks Lightless's per-character dispatch boundary when a supported build is found.
+- Suppresses Lightless only while PlayerSync owns the same character address.
+- Fails open: if discovery or hooking fails, Lightless continues normally.
+- Removes its Harmony patches when the plugin unloads.
 
-### Not implemented yet
-- Runtime interception of Lightless's per-character sync/apply path.
+Use `/syncbridge` to display provider counts, overlap, hook status, observed applies, blocked applies, and any hook failure reason.
 
-The initial version intentionally does **not** guess at internal Lightless offsets or method signatures. The suppression hook should be implemented only after matching it against the exact current Lightless build.
+The suppression path is experimental and must be validated in game against the installed PlayerSync and Lightless versions.
 
 ## Build
 
 Requirements:
 - XIVLauncher / Dalamud
-- .NET 8 SDK
+- .NET 10 SDK
 - Visual Studio 2022 or Rider
 
 Open `SyncBridge.sln` and build `Debug|x64` or `Release|x64`.
@@ -45,7 +43,7 @@ Use:
 /syncbridge
 ```
 
-to show current PlayerSync, Lightless, and overlap counts.
+to show current PlayerSync, Lightless, overlap, and suppression diagnostics.
 
 ## Architecture
 
@@ -55,7 +53,7 @@ PlayerSync.GetHandledAddresses ----\
 LightlessSync.GetHandledAddresses -/
 ```
 
-`LightlessSuppressor` will ultimately arbitrate only the Lightless side. PlayerSync remains untouched.
+`LightlessSuppressor` only intercepts the Lightless side. PlayerSync remains untouched.
 
 ## AI disclosure
 

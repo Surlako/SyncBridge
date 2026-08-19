@@ -23,8 +23,9 @@ jobs:
       - name: Download Dalamud
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile latest.zip
-          Expand-Archive -Force latest.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
+          $dalamudArchive = Join-Path $env:RUNNER_TEMP "dalamud-latest.zip"
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile $dalamudArchive
+          Expand-Archive -Force $dalamudArchive "$env:AppData\XIVLauncher\addon\Hooks\dev"
 
       - name: Build
         run: dotnet build SyncBridge.sln --configuration Release
