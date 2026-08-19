@@ -19,7 +19,7 @@ A Dalamud plugin that makes **PlayerSync the preferred sync provider** and **Lig
 - Provides a saved enable/disable switch and live diagnostics window.
 - Removes its Harmony patches when the plugin unloads.
 
-Use `/syncbridge` to open the settings window. Use `/syncbridge status` to print a one-time chat diagnostic.
+Use `/syncbridge` or `/sb` to open the settings window. Add `status` to either command to print a one-time chat diagnostic.
 
 The suppression path is experimental and must be validated in game against the installed PlayerSync and Lightless versions.
 
@@ -38,13 +38,14 @@ The project uses `Dalamud.NET.Sdk/15.0.0`.
 
 Add the built `SyncBridge.dll` as a Dalamud dev plugin location, then enable it from `/xlplugins`.
 
-Use:
+Use either command:
 
 ```
 /syncbridge
+/sb
 ```
 
-to open the settings and live-status window. Use `/syncbridge status` when you want the same diagnostic as a chat message.
+to open the settings and live-status window. Use `/syncbridge status` or `/sb status` when you want the same diagnostic as a chat message.
 
 ## Architecture
 

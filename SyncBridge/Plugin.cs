@@ -9,6 +9,7 @@ namespace SyncBridge;
 public sealed class Plugin : IDalamudPlugin
 {
     private const string CommandName = "/syncbridge";
+    private const string ShortCommandName = "/sb";
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
@@ -41,6 +42,10 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
             HelpMessage = "Opens SyncBridge settings. Use '/syncbridge status' for a chat diagnostic."
+        });
+        CommandManager.AddHandler(ShortCommandName, new CommandInfo(OnCommand)
+        {
+            HelpMessage = "Short alias for /syncbridge. Use '/sb status' for a chat diagnostic."
         });
 
         Log.Information("SyncBridge loaded.");
@@ -109,6 +114,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsWindow;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleSettingsWindow;
         CommandManager.RemoveHandler(CommandName);
+        CommandManager.RemoveHandler(ShortCommandName);
         windowSystem.RemoveAllWindows();
         Coordinator.Dispose();
     }

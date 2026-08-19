@@ -2,7 +2,7 @@
   "Author": "Steve",
   "Name": "SyncBridge",
   "InternalName": "SyncBridge",
-  "AssemblyVersion": "0.2.7.0",
+  "AssemblyVersion": "0.2.8.0",
   "Description": "Coordinates PlayerSync and Lightless to avoid duplicate handling of the same on-screen character. /syncbridge",
   "ApplicableVersion": "any",
   "Tags": [
