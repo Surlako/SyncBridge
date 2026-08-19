@@ -23,6 +23,7 @@ internal sealed class LightlessSuppressor : IDisposable
     private static readonly Dictionary<MethodBase, DynamicMethod> PrefixFactoryMethods = [];
     private static HashSet<nint> playerSyncOwned = [];
 
+    private readonly FileInfo pluginAssemblyLocation;
     private readonly IPluginLog log;
     private readonly HashSet<MethodBase> patchedMethods = [];
     private readonly Dictionary<MethodBase, DynamicMethod> patchPrefixes = [];
@@ -40,8 +41,9 @@ internal sealed class LightlessSuppressor : IDisposable
     public int SuppressedApplications => Volatile.Read(ref SuppressedCounter[0]);
     public string DiagnosticReason => diagnosticReason;
 
-    public LightlessSuppressor(IPluginLog log)
+    public LightlessSuppressor(FileInfo pluginAssemblyLocation, IPluginLog log)
     {
+        this.pluginAssemblyLocation = pluginAssemblyLocation;
         this.log = log;
         AppContext.SetData(CounterDataKey, SuppressedCounter);
         TryInstallPatch();
@@ -219,7 +221,7 @@ internal sealed class LightlessSuppressor : IDisposable
             ?? throw new InvalidOperationException("Could not create the default-context Harmony instance.");
     }
 
-    private static Assembly GetDefaultContextHarmonyAssembly()
+    private Assembly GetDefaultContextHarmonyAssembly()
     {
         var pluginHarmonyAssembly = typeof(Harmony).Assembly;
         var simpleName = pluginHarmonyAssembly.GetName().Name;
@@ -229,10 +231,18 @@ internal sealed class LightlessSuppressor : IDisposable
         if (defaultAssembly != null)
             return defaultAssembly;
 
-        if (string.IsNullOrWhiteSpace(pluginHarmonyAssembly.Location))
-            throw new FileNotFoundException("The Harmony assembly location is unavailable.");
+        var harmonyPath = pluginHarmonyAssembly.Location;
+        if (string.IsNullOrWhiteSpace(harmonyPath))
+        {
+            var pluginDirectory = pluginAssemblyLocation.Directory
+                ?? throw new DirectoryNotFoundException("The SyncBridge installation directory is unavailable.");
+            harmonyPath = Path.Combine(pluginDirectory.FullName, "0Harmony.dll");
+        }
 
-        return AssemblyLoadContext.Default.LoadFromAssemblyPath(pluginHarmonyAssembly.Location);
+        if (!File.Exists(harmonyPath))
+            throw new FileNotFoundException("The packaged Harmony assembly was not found beside SyncBridge.", harmonyPath);
+
+        return AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.GetFullPath(harmonyPath));
     }
 
     private static MethodInfo CreatePatchPrefix(MethodBase originalMethod)

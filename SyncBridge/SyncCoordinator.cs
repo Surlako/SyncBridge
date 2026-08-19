@@ -25,7 +25,7 @@ internal sealed class SyncCoordinator : IDisposable
         lightlessHandled =
             pluginInterface.GetIpcSubscriber<List<nint>>("LightlessSync.GetHandledAddresses");
 
-        Suppressor = new LightlessSuppressor(log);
+        Suppressor = new LightlessSuppressor(pluginInterface.AssemblyLocation, log);
     }
 
     public void Update()
