@@ -15,7 +15,10 @@ internal sealed class SyncCoordinator : IDisposable
     public SyncState State { get; } = new();
     public LightlessSuppressor Suppressor { get; }
 
-    public SyncCoordinator(IDalamudPluginInterface pluginInterface, IPluginLog log)
+    public SyncCoordinator(
+        IDalamudPluginInterface pluginInterface,
+        IPluginLog log,
+        bool suppressionEnabled)
     {
         this.log = log;
 
@@ -25,7 +28,10 @@ internal sealed class SyncCoordinator : IDisposable
         lightlessHandled =
             pluginInterface.GetIpcSubscriber<List<nint>>("LightlessSync.GetHandledAddresses");
 
-        Suppressor = new LightlessSuppressor(pluginInterface.AssemblyLocation, log);
+        Suppressor = new LightlessSuppressor(
+            pluginInterface.AssemblyLocation,
+            log,
+            suppressionEnabled);
     }
 
     public void Update()

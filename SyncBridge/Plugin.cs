@@ -1,4 +1,5 @@
 using Dalamud.Game.Command;
+using Dalamud.Interface.Windowing;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -15,16 +16,31 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
 
-    private readonly SyncCoordinator coordinator;
+    private readonly WindowSystem windowSystem = new("SyncBridge");
+    private readonly SyncBridgeWindow settingsWindow;
+
+    internal Configuration Configuration { get; }
+    internal SyncCoordinator Coordinator { get; }
 
     public Plugin()
     {
-        coordinator = new SyncCoordinator(PluginInterface, Log);
+        Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        Coordinator = new SyncCoordinator(
+            PluginInterface,
+            Log,
+            Configuration.SuppressionEnabled);
+
+        settingsWindow = new SyncBridgeWindow(this);
+        windowSystem.AddWindow(settingsWindow);
+
         Framework.Update += OnFrameworkUpdate;
+        PluginInterface.UiBuilder.Draw += windowSystem.Draw;
+        PluginInterface.UiBuilder.OpenConfigUi += ToggleSettingsWindow;
+        PluginInterface.UiBuilder.OpenMainUi += ToggleSettingsWindow;
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Shows SyncBridge status."
+            HelpMessage = "Opens SyncBridge settings. Use '/syncbridge status' for a chat diagnostic."
         });
 
         Log.Information("SyncBridge loaded.");
@@ -32,32 +48,68 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework framework)
     {
-        coordinator.Update();
+        Coordinator.Update();
     }
 
     private void OnCommand(string command, string args)
     {
-        var state = coordinator.State;
+        if (string.Equals(args.Trim(), "status", StringComparison.OrdinalIgnoreCase))
+        {
+            PrintStatusToChat();
+            return;
+        }
+
+        settingsWindow.Toggle();
+    }
+
+    internal void SetSuppressionEnabled(bool enabled)
+    {
+        Coordinator.Suppressor.SetEnabled(enabled);
+        Configuration.SuppressionEnabled = enabled;
+        Configuration.Save();
+        Log.Information("SyncBridge suppression {State} by user.", enabled ? "enabled" : "disabled");
+    }
+
+    internal void PrintStatusToChat()
+        => ChatGui.Print(BuildStatusMessage());
+
+    private string BuildStatusMessage()
+    {
+        var state = Coordinator.State;
+        var suppressor = Coordinator.Suppressor;
+        var suppressionStatus = !suppressor.IsEnabled
+            ? "DISABLED"
+            : suppressor.IsOperational
+                ? "ACTIVE"
+                : "INACTIVE";
 
         var message =
             $"PlayerSync: {state.PlayerSyncHandled.Count} | " +
             $"Lightless: {state.LightlessHandled.Count} | " +
             $"Overlap: {state.Overlap.Count} | " +
-            $"Suppression: {(coordinator.Suppressor.IsOperational ? "ACTIVE" : "INACTIVE")} | " +
-            $"Observed applies: {coordinator.Suppressor.ObservedApplications} | " +
-            $"Blocked applies: {coordinator.Suppressor.SuppressedApplications}";
+            $"Suppression: {suppressionStatus} | " +
+            $"Hook: {(suppressor.IsOperational ? "ACTIVE" : "INACTIVE")} | " +
+            $"Observed applies: {suppressor.ObservedApplications} | " +
+            $"Blocked applies: {suppressor.SuppressedApplications}";
 
-        if (!coordinator.Suppressor.IsOperational)
-            message += $" | Reason: {coordinator.Suppressor.DiagnosticReason}";
+        if (!suppressor.IsOperational)
+            message += $" | Reason: {suppressor.DiagnosticReason}";
 
         Log.Information(message);
-        ChatGui.Print(message);
+        return message;
     }
+
+    private void ToggleSettingsWindow()
+        => settingsWindow.Toggle();
 
     public void Dispose()
     {
         Framework.Update -= OnFrameworkUpdate;
+        PluginInterface.UiBuilder.Draw -= windowSystem.Draw;
+        PluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsWindow;
+        PluginInterface.UiBuilder.OpenMainUi -= ToggleSettingsWindow;
         CommandManager.RemoveHandler(CommandName);
-        coordinator.Dispose();
+        windowSystem.RemoveAllWindows();
+        Coordinator.Dispose();
     }
 }

@@ -16,6 +16,7 @@ internal sealed class LightlessSuppressor : IDisposable
     private const string ExactPairHandlerName = "LightlessSync.PlayerData.Pairs.PairHandler";
     private const string LegacyPairHandlerName = "LightlessSync.PlayerData.Handlers.PairHandler";
     private const string OwnershipDataKey = HarmonyId + ".PlayerSyncOwned";
+    private const string EnabledDataKey = HarmonyId + ".Enabled";
     private const string CounterDataKey = HarmonyId + ".SuppressedCounter";
     private const string ObservedCounterDataKey = HarmonyId + ".ObservedCounter";
 
@@ -23,6 +24,7 @@ internal sealed class LightlessSuppressor : IDisposable
     private static readonly object PrefixFactoryLock = new();
     private static readonly int[] SuppressedCounter = [0];
     private static readonly int[] ObservedCounter = [0];
+    private static readonly int[] EnabledState = [1];
     private static readonly Dictionary<MethodBase, DynamicMethod> PrefixFactoryMethods = [];
     private static HashSet<nint> playerSyncOwned = [];
 
@@ -41,17 +43,28 @@ internal sealed class LightlessSuppressor : IDisposable
     private string diagnosticReason = "suppression hook has not been attempted";
 
     public bool IsOperational => patchedMethods.Count > 0;
+    public bool IsEnabled => Volatile.Read(ref EnabledState[0]) != 0;
     public int SuppressedApplications => Volatile.Read(ref SuppressedCounter[0]);
     public int ObservedApplications => Volatile.Read(ref ObservedCounter[0]);
     public string DiagnosticReason => diagnosticReason;
 
-    public LightlessSuppressor(FileInfo pluginAssemblyLocation, IPluginLog log)
+    public LightlessSuppressor(
+        FileInfo pluginAssemblyLocation,
+        IPluginLog log,
+        bool enabled)
     {
         this.pluginAssemblyLocation = pluginAssemblyLocation;
         this.log = log;
+        SetEnabled(enabled);
         AppContext.SetData(CounterDataKey, SuppressedCounter);
         AppContext.SetData(ObservedCounterDataKey, ObservedCounter);
         TryInstallPatch();
+    }
+
+    public void SetEnabled(bool enabled)
+    {
+        Volatile.Write(ref EnabledState[0], enabled ? 1 : 0);
+        AppContext.SetData(EnabledDataKey, EnabledState);
     }
 
     public void SetPlayerSyncOwned(IEnumerable<nint> addresses)
@@ -70,7 +83,7 @@ internal sealed class LightlessSuppressor : IDisposable
     }
 
     public bool ShouldSuppress(nint gameObjectAddress)
-        => IsPlayerSyncOwned(gameObjectAddress);
+        => IsEnabled && IsPlayerSyncOwned(gameObjectAddress);
 
     private void TryInstallPatch()
     {
@@ -384,6 +397,7 @@ internal sealed class LightlessSuppressor : IDisposable
         var ownedAddresses = il.DeclareLocal(typeof(HashSet<nint>));
         var counter = il.DeclareLocal(typeof(int[]));
         var observedCounter = il.DeclareLocal(typeof(int[]));
+        var enabledState = il.DeclareLocal(typeof(int[]));
         var realization = realizationType != null ? il.DeclareLocal(realizationType) : null;
         var prefixResult = il.DeclareLocal(typeof(bool));
         var afterObservedIncrement = il.DefineLabel();
@@ -404,6 +418,17 @@ internal sealed class LightlessSuppressor : IDisposable
         il.Emit(OpCodes.Call, incrementCounter);
         il.Emit(OpCodes.Pop);
         il.MarkLabel(afterObservedIncrement);
+
+        il.Emit(OpCodes.Ldstr, EnabledDataKey);
+        il.Emit(OpCodes.Call, getAppContextData);
+        il.Emit(OpCodes.Isinst, typeof(int[]));
+        il.Emit(OpCodes.Stloc, enabledState);
+        il.Emit(OpCodes.Ldloc, enabledState);
+        il.Emit(OpCodes.Brfalse, allowOriginal);
+        il.Emit(OpCodes.Ldloc, enabledState);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ldelem_I4);
+        il.Emit(OpCodes.Brfalse, allowOriginal);
 
         il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Castclass, pairHandlerType);
@@ -666,7 +691,9 @@ internal sealed class LightlessSuppressor : IDisposable
         lock (OwnershipLock)
             playerSyncOwned.Clear();
 
+        Volatile.Write(ref EnabledState[0], 0);
         AppContext.SetData(OwnershipDataKey, null);
+        AppContext.SetData(EnabledDataKey, null);
         AppContext.SetData(CounterDataKey, null);
         AppContext.SetData(ObservedCounterDataKey, null);
 

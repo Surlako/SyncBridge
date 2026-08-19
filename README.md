@@ -16,9 +16,10 @@ A Dalamud plugin that makes **PlayerSync the preferred sync provider** and **Lig
 - Hooks Lightless's per-character dispatch boundary when a supported build is found.
 - Suppresses Lightless only while PlayerSync owns the same character address.
 - Fails open: if discovery or hooking fails, Lightless continues normally.
+- Provides a saved enable/disable switch and live diagnostics window.
 - Removes its Harmony patches when the plugin unloads.
 
-Use `/syncbridge` to display provider counts, overlap, hook status, observed applies, blocked applies, and any hook failure reason.
+Use `/syncbridge` to open the settings window. Use `/syncbridge status` to print a one-time chat diagnostic.
 
 The suppression path is experimental and must be validated in game against the installed PlayerSync and Lightless versions.
 
@@ -43,7 +44,7 @@ Use:
 /syncbridge
 ```
 
-to show current PlayerSync, Lightless, overlap, and suppression diagnostics.
+to open the settings and live-status window. Use `/syncbridge status` when you want the same diagnostic as a chat message.
 
 ## Architecture
 
