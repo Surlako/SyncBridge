@@ -17,8 +17,8 @@
     "DalamudApiLevel": 15,
     "IsHide": "False",
     "IsTestingExclusive": "False",
-    "DownloadLinkInstall": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/latest.zip",
-    "DownloadLinkTesting": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/latest.zip",
-    "DownloadLinkUpdate": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/latest.zip"
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/SyncBridge-0.2.8.0.zip",
+    "DownloadLinkTesting": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/SyncBridge-0.2.8.0.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/Surlako/SyncBridge/main/SyncBridge-0.2.8.0.zip"
   }
 ]
