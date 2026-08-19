@@ -24,6 +24,7 @@ internal sealed class LightlessSuppressor : IDisposable
     private Harmony? harmony;
     private DateTime nextPatchAttemptUtc = DateTime.MinValue;
     private bool disposed;
+    private bool retryAllowed = true;
     private string diagnosticReason = "suppression hook has not been attempted";
 
     public bool IsOperational => patchedMethods.Count > 0;
@@ -45,7 +46,7 @@ internal sealed class LightlessSuppressor : IDisposable
                 .ToHashSet();
         }
 
-        if (!IsOperational && DateTime.UtcNow >= nextPatchAttemptUtc)
+        if (retryAllowed && !IsOperational && DateTime.UtcNow >= nextPatchAttemptUtc)
             TryInstallPatch();
     }
 
@@ -57,7 +58,7 @@ internal sealed class LightlessSuppressor : IDisposable
         if (disposed)
             return;
 
-        nextPatchAttemptUtc = DateTime.UtcNow.AddSeconds(2);
+        nextPatchAttemptUtc = DateTime.UtcNow.AddSeconds(10);
 
         try
         {
@@ -66,14 +67,14 @@ internal sealed class LightlessSuppressor : IDisposable
 
             if (lightlessAssemblies.Length == 0)
             {
-                SetInactiveReason("no Lightless assembly found");
+                SetInactiveReason("no Lightless assembly found", retry: true);
                 return;
             }
 
             var pairHandlerTypes = FindPairHandlerTypes(lightlessAssemblies).ToArray();
             if (pairHandlerTypes.Length == 0)
             {
-                SetInactiveReason("Lightless assembly found but PairHandler missing");
+                SetInactiveReason("Lightless assembly found but PairHandler missing", retry: false);
                 return;
             }
 
@@ -94,18 +95,14 @@ internal sealed class LightlessSuppressor : IDisposable
 
                 foundPlayerCharacter = true;
 
-                lock (PropertyLock)
-                    PlayerCharacterProperties[pairHandlerType] = playerCharacterProperty;
+                var installedForType = 0;
 
                 foreach (var method in GetSupportedApplyMethods(pairHandlerType))
                 {
                     foundSupportedMethod = true;
 
-                    if (patchedMethods.Contains(method) || IsAlreadyPatchedByUs(method))
-                    {
-                        patchedMethods.Add(method);
+                    if (patchedMethods.Contains(method))
                         continue;
-                    }
 
                     try
                     {
@@ -118,8 +115,13 @@ internal sealed class LightlessSuppressor : IDisposable
                             BindingFlags.Static | BindingFlags.NonPublic)
                             ?? throw new MissingMethodException(typeof(LightlessSuppressor).FullName, prefixName);
 
+                        lock (PropertyLock)
+                            PlayerCharacterProperties[pairHandlerType] = playerCharacterProperty;
+
+                        using var reflectionScope = AssemblyLoadContext.EnterContextualReflection(pairHandlerType.Assembly);
                         harmony.Patch(method, prefix: new HarmonyMethod(prefix));
                         patchedMethods.Add(method);
+                        installedForType++;
                     }
                     catch (Exception ex)
                     {
@@ -131,6 +133,12 @@ internal sealed class LightlessSuppressor : IDisposable
                             method.Name);
                     }
                 }
+
+                if (installedForType == 0)
+                {
+                    lock (PropertyLock)
+                        PlayerCharacterProperties.Remove(pairHandlerType);
+                }
             }
 
             if (patchedMethods.Count > 0)
@@ -141,29 +149,30 @@ internal sealed class LightlessSuppressor : IDisposable
             }
 
             if (!foundPlayerCharacter)
-                SetInactiveReason("PairHandler found but PlayerCharacter missing");
+                SetInactiveReason("PairHandler found but PlayerCharacter missing", retry: false);
             else if (!foundSupportedMethod)
-                SetInactiveReason("PairHandler found but no supported apply method");
+                SetInactiveReason("PairHandler found but no supported apply method", retry: false);
             else
-                SetInactiveReason($"hook error: {hookErrors.FirstOrDefault()?.GetBaseException().Message ?? "unknown error"}");
+                SetInactiveReason(
+                    $"hook error: {hookErrors.FirstOrDefault()?.GetBaseException().Message ?? "unknown error"}",
+                    retry: false);
         }
         catch (Exception ex)
         {
-            SetInactiveReason($"hook error: {ex.GetBaseException().Message}");
+            SetInactiveReason($"hook error: {ex.GetBaseException().Message}", retry: false);
             log.Error(ex, "Failed to install the Lightless suppression hook.");
         }
     }
 
-    private void SetInactiveReason(string reason)
+    private void SetInactiveReason(string reason, bool retry)
     {
         diagnosticReason = reason;
-        log.Debug("SyncBridge suppression INACTIVE: {Reason}; will retry.", reason);
-    }
+        retryAllowed = retry;
 
-    private static bool IsAlreadyPatchedByUs(MethodBase method)
-    {
-        var patchInfo = Harmony.GetPatchInfo(method);
-        return patchInfo?.Owners.Contains(HarmonyId) == true;
+        if (retry)
+            log.Debug("SyncBridge suppression INACTIVE: {Reason}; will retry in 10 seconds.", reason);
+        else
+            log.Warning("SyncBridge suppression INACTIVE: {Reason}; retries disabled to protect frame time.", reason);
     }
 
     private static bool ApplyCharacterDataPrefix(object __instance)
@@ -269,15 +278,30 @@ internal sealed class LightlessSuppressor : IDisposable
 
     private static IEnumerable<Type> FindPairHandlerTypes(IEnumerable<Assembly> assemblies)
     {
-        var allTypes = assemblies.SelectMany(GetLoadableTypes).ToArray();
-        var exactTypes = allTypes
-            .Where(type => string.Equals(type.FullName, ExactPairHandlerName, StringComparison.Ordinal))
-            .ToArray();
+        var assemblyArray = assemblies.ToArray();
+        var exactTypes = new HashSet<Type>(ReferenceEqualityComparer.Instance);
+
+        foreach (var assembly in assemblyArray)
+        {
+            try
+            {
+                var exactType = assembly.GetType(ExactPairHandlerName, throwOnError: false, ignoreCase: false);
+                if (exactType != null)
+                    exactTypes.Add(exactType);
+            }
+            catch
+            {
+                // Continue to the compatibility scan below.
+            }
+        }
 
         foreach (var type in exactTypes)
             yield return type;
 
-        foreach (var type in allTypes)
+        if (exactTypes.Count > 0)
+            yield break;
+
+        foreach (var type in assemblyArray.SelectMany(GetLoadableTypes))
         {
             if (exactTypes.Contains(type) || !string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
                 continue;
@@ -324,7 +348,14 @@ internal sealed class LightlessSuppressor : IDisposable
 
         try
         {
-            harmony?.UnpatchAll(HarmonyId);
+            if (harmony != null)
+            {
+                foreach (var method in patchedMethods)
+                {
+                    using var reflectionScope = AssemblyLoadContext.EnterContextualReflection(method.Module.Assembly);
+                    harmony.Unpatch(method, HarmonyPatchType.All, HarmonyId);
+                }
+            }
         }
         catch (Exception ex)
         {
