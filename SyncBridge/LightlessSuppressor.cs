@@ -13,13 +13,16 @@ namespace SyncBridge;
 internal sealed class LightlessSuppressor : IDisposable
 {
     private const string HarmonyId = "Surlako.SyncBridge.LightlessSuppressor";
-    private const string ExactPairHandlerName = "LightlessSync.PlayerData.Handlers.PairHandler";
+    private const string ExactPairHandlerName = "LightlessSync.PlayerData.Pairs.PairHandler";
+    private const string LegacyPairHandlerName = "LightlessSync.PlayerData.Handlers.PairHandler";
     private const string OwnershipDataKey = HarmonyId + ".PlayerSyncOwned";
     private const string CounterDataKey = HarmonyId + ".SuppressedCounter";
+    private const string ObservedCounterDataKey = HarmonyId + ".ObservedCounter";
 
     private static readonly object OwnershipLock = new();
     private static readonly object PrefixFactoryLock = new();
     private static readonly int[] SuppressedCounter = [0];
+    private static readonly int[] ObservedCounter = [0];
     private static readonly Dictionary<MethodBase, DynamicMethod> PrefixFactoryMethods = [];
     private static HashSet<nint> playerSyncOwned = [];
 
@@ -39,6 +42,7 @@ internal sealed class LightlessSuppressor : IDisposable
 
     public bool IsOperational => patchedMethods.Count > 0;
     public int SuppressedApplications => Volatile.Read(ref SuppressedCounter[0]);
+    public int ObservedApplications => Volatile.Read(ref ObservedCounter[0]);
     public string DiagnosticReason => diagnosticReason;
 
     public LightlessSuppressor(FileInfo pluginAssemblyLocation, IPluginLog log)
@@ -46,6 +50,7 @@ internal sealed class LightlessSuppressor : IDisposable
         this.pluginAssemblyLocation = pluginAssemblyLocation;
         this.log = log;
         AppContext.SetData(CounterDataKey, SuppressedCounter);
+        AppContext.SetData(ObservedCounterDataKey, ObservedCounter);
         TryInstallPatch();
     }
 
@@ -121,7 +126,7 @@ internal sealed class LightlessSuppressor : IDisposable
                         var prefix = CreateContextLocalPrefix(
                             pairHandlerType,
                             playerCharacterProperty,
-                            returnsTask: method.ReturnType == typeof(Task));
+                            method);
 
                         lock (PrefixFactoryLock)
                             PrefixFactoryMethods[method] = prefix;
@@ -150,7 +155,8 @@ internal sealed class LightlessSuppressor : IDisposable
 
             if (patchedMethods.Count > 0)
             {
-                diagnosticReason = $"hooked {patchedMethods.Count} Lightless character-apply method(s)";
+                var targets = string.Join(", ", patchedMethods.Select(method => method.Name).Distinct());
+                diagnosticReason = $"hooked {patchedMethods.Count} Lightless character-apply method(s): {targets}";
                 log.Information("SyncBridge suppression ACTIVE: {Reason}.", diagnosticReason);
                 return;
             }
@@ -273,24 +279,34 @@ internal sealed class LightlessSuppressor : IDisposable
     private static DynamicMethod CreateContextLocalPrefix(
         Type pairHandlerType,
         PropertyInfo playerCharacterProperty,
-        bool returnsTask)
+        MethodInfo targetMethod)
     {
         var getter = playerCharacterProperty.GetMethod
             ?? throw new MissingMethodException(pairHandlerType.FullName, "get_PlayerCharacter");
+        var returnsTask = targetMethod.ReturnType == typeof(Task);
+        var isDispatchBoundary = targetMethod.Name == "DownloadAndApplyCharacter";
+        var targetParameters = targetMethod.GetParameters();
 
-        var parameterTypes = returnsTask
-            ? new[] { typeof(object), typeof(Task).MakeByRefType() }
-            : new[] { typeof(object) };
+        if (isDispatchBoundary && targetParameters.Length != 1)
+            throw new MissingMethodException(pairHandlerType.FullName, "DownloadAndApplyCharacter(ApplyContext)");
+
+        var parameterTypes = isDispatchBoundary
+            ? new[] { typeof(object), targetParameters[0].ParameterType }
+            : returnsTask
+                ? new[] { typeof(object), typeof(Task).MakeByRefType() }
+                : new[] { typeof(object) };
 
         var prefix = new DynamicMethod(
-            $"SyncBridge_{pairHandlerType.Name}_{(returnsTask ? "Async" : "Void")}_Prefix",
+            $"SyncBridge_{pairHandlerType.Name}_{targetMethod.Name}_Prefix",
             typeof(bool),
             parameterTypes,
             pairHandlerType.Module,
             skipVisibility: true);
 
         prefix.DefineParameter(1, ParameterAttributes.None, "__instance");
-        if (returnsTask)
+        if (isDispatchBoundary)
+            prefix.DefineParameter(2, ParameterAttributes.None, "__0");
+        else if (returnsTask)
             prefix.DefineParameter(2, ParameterAttributes.None, "__result");
 
         var getAppContextData = typeof(AppContext).GetMethod(
@@ -322,15 +338,72 @@ internal sealed class LightlessSuppressor : IDisposable
                 ?? throw new MissingMethodException(typeof(Task).FullName, $"get_{nameof(Task.CompletedTask)}")
             : null;
 
+        MethodInfo? restoreApplyIntent = null;
+        FieldInfo? pairRedrawManagerField = null;
+        MethodInfo? abortPlayerScope = null;
+        MethodInfo? realizationGetter = null;
+        MethodInfo? consumedForceApplyModsGetter = null;
+        Type? realizationType = null;
+
+        if (isDispatchBoundary)
+        {
+            // Lightless 3.2.4 has already retained the desired character state at
+            // this boundary. Mirror its own early-exit cleanup before skipping
+            // downloads, Penumbra/Glamourer work, and redraws.
+            restoreApplyIntent = pairHandlerType.GetMethod(
+                "RestoreApplyIntent",
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                binder: null,
+                types: [typeof(bool)],
+                modifiers: null)
+                ?? throw new MissingMethodException(pairHandlerType.FullName, "RestoreApplyIntent(bool)");
+            pairRedrawManagerField = pairHandlerType.GetField(
+                "_pairRedrawManager",
+                BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new MissingFieldException(pairHandlerType.FullName, "_pairRedrawManager");
+            abortPlayerScope = pairRedrawManagerField.FieldType.GetMethod(
+                "AbortPlayerScope",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                types: Type.EmptyTypes,
+                modifiers: null)
+                ?? throw new MissingMethodException(pairRedrawManagerField.FieldType.FullName, "AbortPlayerScope()");
+            realizationGetter = targetParameters[0].ParameterType.GetProperty(
+                "Realization",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetMethod
+                ?? throw new MissingMemberException(targetParameters[0].ParameterType.FullName, "Realization");
+            realizationType = realizationGetter.ReturnType;
+            consumedForceApplyModsGetter = realizationType.GetProperty(
+                "ConsumedForceApplyMods",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetMethod
+                ?? throw new MissingMemberException(realizationType.FullName, "ConsumedForceApplyMods");
+        }
+
         var il = prefix.GetILGenerator();
         var address = il.DeclareLocal(typeof(nint));
         var ownedAddresses = il.DeclareLocal(typeof(HashSet<nint>));
         var counter = il.DeclareLocal(typeof(int[]));
+        var observedCounter = il.DeclareLocal(typeof(int[]));
+        var realization = realizationType != null ? il.DeclareLocal(realizationType) : null;
         var prefixResult = il.DeclareLocal(typeof(bool));
+        var afterObservedIncrement = il.DefineLabel();
         var allowOriginal = il.DefineLabel();
         var returnResult = il.DefineLabel();
 
         il.BeginExceptionBlock();
+
+        il.Emit(OpCodes.Ldstr, ObservedCounterDataKey);
+        il.Emit(OpCodes.Call, getAppContextData);
+        il.Emit(OpCodes.Isinst, typeof(int[]));
+        il.Emit(OpCodes.Stloc, observedCounter);
+        il.Emit(OpCodes.Ldloc, observedCounter);
+        il.Emit(OpCodes.Brfalse, afterObservedIncrement);
+        il.Emit(OpCodes.Ldloc, observedCounter);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ldelema, typeof(int));
+        il.Emit(OpCodes.Call, incrementCounter);
+        il.Emit(OpCodes.Pop);
+        il.MarkLabel(afterObservedIncrement);
 
         il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Castclass, pairHandlerType);
@@ -359,7 +432,31 @@ internal sealed class LightlessSuppressor : IDisposable
         il.Emit(OpCodes.Ldloc, counter);
         il.Emit(OpCodes.Brfalse, allowOriginal);
 
-        if (returnsTask)
+        if (isDispatchBoundary)
+        {
+            var applyContextType = targetParameters[0].ParameterType;
+            if (applyContextType.IsValueType)
+                il.Emit(OpCodes.Ldarga_S, (byte)1);
+            else
+                il.Emit(OpCodes.Ldarg_1);
+            il.Emit(applyContextType.IsValueType ? OpCodes.Call : OpCodes.Callvirt, realizationGetter!);
+            il.Emit(OpCodes.Stloc, realization!);
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Castclass, pairHandlerType);
+            if (realizationType!.IsValueType)
+                il.Emit(OpCodes.Ldloca, realization!);
+            else
+                il.Emit(OpCodes.Ldloc, realization!);
+            il.Emit(realizationType.IsValueType ? OpCodes.Call : OpCodes.Callvirt, consumedForceApplyModsGetter!);
+            il.Emit(OpCodes.Call, restoreApplyIntent!);
+
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Castclass, pairHandlerType);
+            il.Emit(OpCodes.Ldfld, pairRedrawManagerField!);
+            il.Emit(OpCodes.Callvirt, abortPlayerScope!);
+        }
+        else if (returnsTask)
         {
             il.Emit(OpCodes.Ldarg_1);
             il.Emit(OpCodes.Call, completedTaskGetter!);
@@ -453,19 +550,23 @@ internal sealed class LightlessSuppressor : IDisposable
     private static IEnumerable<Type> FindPairHandlerTypes(IEnumerable<Assembly> assemblies)
     {
         var assemblyArray = assemblies.ToArray();
-        var exactTypes = new HashSet<Type>(ReferenceEqualityComparer.Instance);
+        var exactTypes = new List<Type>();
+        var seenExactTypes = new HashSet<Type>(ReferenceEqualityComparer.Instance);
 
-        foreach (var assembly in assemblyArray)
+        foreach (var exactName in new[] { ExactPairHandlerName, LegacyPairHandlerName })
         {
-            try
+            foreach (var assembly in assemblyArray)
             {
-                var exactType = assembly.GetType(ExactPairHandlerName, throwOnError: false, ignoreCase: false);
-                if (exactType != null)
-                    exactTypes.Add(exactType);
-            }
-            catch
-            {
-                // Continue to the compatibility scan below.
+                try
+                {
+                    var exactType = assembly.GetType(exactName, throwOnError: false, ignoreCase: false);
+                    if (exactType != null && seenExactTypes.Add(exactType))
+                        exactTypes.Add(exactType);
+                }
+                catch
+                {
+                    // Continue to the compatibility scan below.
+                }
             }
         }
 
@@ -477,7 +578,7 @@ internal sealed class LightlessSuppressor : IDisposable
 
         foreach (var type in assemblyArray.SelectMany(GetLoadableTypes))
         {
-            if (exactTypes.Contains(type) || !string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
+            if (seenExactTypes.Contains(type) || !string.Equals(type.Name, "PairHandler", StringComparison.Ordinal))
                 continue;
 
             var assemblyName = type.Assembly.GetName().Name ?? string.Empty;
@@ -490,11 +591,28 @@ internal sealed class LightlessSuppressor : IDisposable
 
     private static IEnumerable<MethodInfo> GetSupportedApplyMethods(Type pairHandlerType)
     {
-        return pairHandlerType
-            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+        var methods = pairHandlerType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        var dispatchBoundary = methods
             .Where(method =>
-                (method.Name == "ApplyCharacterData" && method.ReturnType == typeof(void)) ||
-                (method.Name == "ApplyCharacterDataAsync" && method.ReturnType == typeof(Task)));
+                method.Name == "DownloadAndApplyCharacter" &&
+                method.ReturnType == typeof(void) &&
+                method.GetParameters().Length == 1)
+            .ToArray();
+        if (dispatchBoundary.Length > 0)
+            // The async ApplyCharacterData stub can already be inlined before
+            // SyncBridge loads. This larger synchronous boundary remains detourable.
+            return dispatchBoundary;
+
+        var legacyApply = methods
+            .Where(method => method.Name == "ApplyCharacterData" && method.ReturnType == typeof(void))
+            .ToArray();
+        if (legacyApply.Length > 0)
+            return legacyApply;
+
+        return methods.Where(method =>
+            method.Name == "ApplyCharacterDataAsync" && method.ReturnType == typeof(Task));
     }
 
     private static IEnumerable<Type> GetLoadableTypes(Assembly assembly)
@@ -550,6 +668,7 @@ internal sealed class LightlessSuppressor : IDisposable
 
         AppContext.SetData(OwnershipDataKey, null);
         AppContext.SetData(CounterDataKey, null);
+        AppContext.SetData(ObservedCounterDataKey, null);
 
         if (unpatchFailed)
             log.Warning("LightlessSuppressor disposed fail-open; one or more patches could not be removed.");

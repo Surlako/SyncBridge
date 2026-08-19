@@ -44,6 +44,7 @@ public sealed class Plugin : IDalamudPlugin
             $"Lightless: {state.LightlessHandled.Count} | " +
             $"Overlap: {state.Overlap.Count} | " +
             $"Suppression: {(coordinator.Suppressor.IsOperational ? "ACTIVE" : "INACTIVE")} | " +
+            $"Observed applies: {coordinator.Suppressor.ObservedApplications} | " +
             $"Blocked applies: {coordinator.Suppressor.SuppressedApplications}";
 
         if (!coordinator.Suppressor.IsOperational)
