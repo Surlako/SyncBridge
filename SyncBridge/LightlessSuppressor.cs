@@ -1,5 +1,7 @@
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.Loader;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,39 +14,49 @@ internal sealed class LightlessSuppressor : IDisposable
 {
     private const string HarmonyId = "Surlako.SyncBridge.LightlessSuppressor";
     private const string ExactPairHandlerName = "LightlessSync.PlayerData.Handlers.PairHandler";
+    private const string OwnershipDataKey = HarmonyId + ".PlayerSyncOwned";
+    private const string CounterDataKey = HarmonyId + ".SuppressedCounter";
 
     private static readonly object OwnershipLock = new();
-    private static readonly object PropertyLock = new();
-    private static readonly Dictionary<Type, PropertyInfo> PlayerCharacterProperties = [];
+    private static readonly object PrefixFactoryLock = new();
+    private static readonly int[] SuppressedCounter = [0];
+    private static readonly Dictionary<MethodBase, DynamicMethod> PrefixFactoryMethods = [];
     private static HashSet<nint> playerSyncOwned = [];
-    private static int suppressedApplications;
 
     private readonly IPluginLog log;
     private readonly HashSet<MethodBase> patchedMethods = [];
-    private Harmony? harmony;
+    private readonly Dictionary<MethodBase, DynamicMethod> patchPrefixes = [];
+    private object? harmony;
+    private Type? harmonyMethodType;
+    private MethodInfo? harmonyPatchMethod;
+    private MethodInfo? harmonyUnpatchMethod;
+    private MethodInfo? prefixFactoryMethod;
     private DateTime nextPatchAttemptUtc = DateTime.MinValue;
     private bool disposed;
     private bool retryAllowed = true;
     private string diagnosticReason = "suppression hook has not been attempted";
 
     public bool IsOperational => patchedMethods.Count > 0;
-    public int SuppressedApplications => Volatile.Read(ref suppressedApplications);
+    public int SuppressedApplications => Volatile.Read(ref SuppressedCounter[0]);
     public string DiagnosticReason => diagnosticReason;
 
     public LightlessSuppressor(IPluginLog log)
     {
         this.log = log;
+        AppContext.SetData(CounterDataKey, SuppressedCounter);
         TryInstallPatch();
     }
 
     public void SetPlayerSyncOwned(IEnumerable<nint> addresses)
     {
+        var owned = addresses
+            .Where(address => address != nint.Zero)
+            .ToHashSet();
+
         lock (OwnershipLock)
-        {
-            playerSyncOwned = addresses
-                .Where(address => address != nint.Zero)
-                .ToHashSet();
-        }
+            playerSyncOwned = owned;
+
+        AppContext.SetData(OwnershipDataKey, owned);
 
         if (retryAllowed && !IsOperational && DateTime.UtcNow >= nextPatchAttemptUtc)
             TryInstallPatch();
@@ -82,7 +94,7 @@ internal sealed class LightlessSuppressor : IDisposable
             var foundSupportedMethod = false;
             var hookErrors = new List<Exception>();
 
-            harmony ??= new Harmony(HarmonyId);
+            EnsureHarmonyRuntime();
 
             foreach (var pairHandlerType in pairHandlerTypes)
             {
@@ -95,8 +107,6 @@ internal sealed class LightlessSuppressor : IDisposable
 
                 foundPlayerCharacter = true;
 
-                var installedForType = 0;
-
                 foreach (var method in GetSupportedApplyMethods(pairHandlerType))
                 {
                     foundSupportedMethod = true;
@@ -106,25 +116,26 @@ internal sealed class LightlessSuppressor : IDisposable
 
                     try
                     {
-                        var prefixName = method.ReturnType == typeof(void)
-                            ? nameof(ApplyCharacterDataPrefix)
-                            : nameof(ApplyCharacterDataAsyncPrefix);
+                        var prefix = CreateContextLocalPrefix(
+                            pairHandlerType,
+                            playerCharacterProperty,
+                            returnsTask: method.ReturnType == typeof(Task));
 
-                        var prefix = typeof(LightlessSuppressor).GetMethod(
-                            prefixName,
-                            BindingFlags.Static | BindingFlags.NonPublic)
-                            ?? throw new MissingMethodException(typeof(LightlessSuppressor).FullName, prefixName);
-
-                        lock (PropertyLock)
-                            PlayerCharacterProperties[pairHandlerType] = playerCharacterProperty;
+                        lock (PrefixFactoryLock)
+                            PrefixFactoryMethods[method] = prefix;
 
                         using var reflectionScope = AssemblyLoadContext.EnterContextualReflection(pairHandlerType.Assembly);
-                        harmony.Patch(method, prefix: new HarmonyMethod(prefix));
+                        var harmonyPrefix = Activator.CreateInstance(harmonyMethodType!, [prefixFactoryMethod!])
+                            ?? throw new InvalidOperationException("Could not create the default-context Harmony prefix descriptor.");
+                        harmonyPatchMethod!.Invoke(harmony, [method, harmonyPrefix, null, null, null]);
                         patchedMethods.Add(method);
-                        installedForType++;
+                        patchPrefixes[method] = prefix;
                     }
                     catch (Exception ex)
                     {
+                        lock (PrefixFactoryLock)
+                            PrefixFactoryMethods.Remove(method);
+
                         hookErrors.Add(ex);
                         log.Error(
                             ex,
@@ -132,12 +143,6 @@ internal sealed class LightlessSuppressor : IDisposable
                             pairHandlerType.FullName ?? pairHandlerType.Name,
                             method.Name);
                     }
-                }
-
-                if (installedForType == 0)
-                {
-                    lock (PropertyLock)
-                        PlayerCharacterProperties.Remove(pairHandlerType);
                 }
             }
 
@@ -164,6 +169,86 @@ internal sealed class LightlessSuppressor : IDisposable
         }
     }
 
+    private void EnsureHarmonyRuntime()
+    {
+        if (harmony != null)
+            return;
+
+        // MonoMod cannot build Harmony's wrapper when its engine is loaded in a
+        // collectible plugin context. Keep the engine in the default context;
+        // the generated prefix itself is still owned by Lightless's module.
+        var harmonyAssembly = GetDefaultContextHarmonyAssembly();
+        var harmonyType = harmonyAssembly.GetType("HarmonyLib.Harmony", throwOnError: true)
+            ?? throw new TypeLoadException("HarmonyLib.Harmony");
+        harmonyMethodType = harmonyAssembly.GetType("HarmonyLib.HarmonyMethod", throwOnError: true)
+            ?? throw new TypeLoadException("HarmonyLib.HarmonyMethod");
+        prefixFactoryMethod = typeof(LightlessSuppressor).GetMethod(
+            nameof(CreatePatchPrefix),
+            BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(typeof(LightlessSuppressor).FullName, nameof(CreatePatchPrefix));
+
+        harmonyPatchMethod = harmonyType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+            .FirstOrDefault(method =>
+            {
+                if (method.Name != "Patch")
+                    return false;
+
+                var parameters = method.GetParameters();
+                return parameters.Length == 5 &&
+                       parameters[0].ParameterType == typeof(MethodBase) &&
+                       parameters[1].ParameterType.FullName == "HarmonyLib.HarmonyMethod";
+            })
+            ?? throw new MissingMethodException(harmonyType.FullName, "Patch");
+
+        harmonyUnpatchMethod = harmonyType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+            .FirstOrDefault(method =>
+            {
+                if (method.Name != "Unpatch")
+                    return false;
+
+                var parameters = method.GetParameters();
+                return parameters.Length == 2 &&
+                       parameters[0].ParameterType == typeof(MethodBase) &&
+                       parameters[1].ParameterType == typeof(MethodInfo);
+            })
+            ?? throw new MissingMethodException(harmonyType.FullName, "Unpatch(MethodBase, MethodInfo)");
+
+        harmony = Activator.CreateInstance(harmonyType, [HarmonyId])
+            ?? throw new InvalidOperationException("Could not create the default-context Harmony instance.");
+    }
+
+    private static Assembly GetDefaultContextHarmonyAssembly()
+    {
+        var pluginHarmonyAssembly = typeof(Harmony).Assembly;
+        var simpleName = pluginHarmonyAssembly.GetName().Name;
+        var defaultAssembly = AssemblyLoadContext.Default.Assemblies.FirstOrDefault(assembly =>
+            string.Equals(assembly.GetName().Name, simpleName, StringComparison.OrdinalIgnoreCase));
+
+        if (defaultAssembly != null)
+            return defaultAssembly;
+
+        if (string.IsNullOrWhiteSpace(pluginHarmonyAssembly.Location))
+            throw new FileNotFoundException("The Harmony assembly location is unavailable.");
+
+        return AssemblyLoadContext.Default.LoadFromAssemblyPath(pluginHarmonyAssembly.Location);
+    }
+
+    private static MethodInfo CreatePatchPrefix(MethodBase originalMethod)
+    {
+        // Harmony calls this factory while constructing the wrapper. Returning a
+        // target-owned DynamicMethod prevents the wrapper from referencing the
+        // collectible SyncBridge assembly at runtime.
+        lock (PrefixFactoryLock)
+        {
+            if (PrefixFactoryMethods.TryGetValue(originalMethod, out var prefix))
+                return prefix;
+        }
+
+        throw new MissingMethodException($"No SyncBridge prefix was prepared for {originalMethod}.");
+    }
+
     private void SetInactiveReason(string reason, bool retry)
     {
         diagnosticReason = reason;
@@ -175,49 +260,128 @@ internal sealed class LightlessSuppressor : IDisposable
             log.Warning("SyncBridge suppression INACTIVE: {Reason}; retries disabled to protect frame time.", reason);
     }
 
-    private static bool ApplyCharacterDataPrefix(object __instance)
+    private static DynamicMethod CreateContextLocalPrefix(
+        Type pairHandlerType,
+        PropertyInfo playerCharacterProperty,
+        bool returnsTask)
     {
-        if (!ShouldSuppressInstance(__instance))
-            return true;
+        var getter = playerCharacterProperty.GetMethod
+            ?? throw new MissingMethodException(pairHandlerType.FullName, "get_PlayerCharacter");
 
-        Interlocked.Increment(ref suppressedApplications);
-        return false;
-    }
+        var parameterTypes = returnsTask
+            ? new[] { typeof(object), typeof(Task).MakeByRefType() }
+            : new[] { typeof(object) };
 
-    private static bool ApplyCharacterDataAsyncPrefix(object __instance, ref Task __result)
-    {
-        if (!ShouldSuppressInstance(__instance))
-            return true;
+        var prefix = new DynamicMethod(
+            $"SyncBridge_{pairHandlerType.Name}_{(returnsTask ? "Async" : "Void")}_Prefix",
+            typeof(bool),
+            parameterTypes,
+            pairHandlerType.Module,
+            skipVisibility: true);
 
-        __result = Task.CompletedTask;
-        Interlocked.Increment(ref suppressedApplications);
-        return false;
-    }
+        prefix.DefineParameter(1, ParameterAttributes.None, "__instance");
+        if (returnsTask)
+            prefix.DefineParameter(2, ParameterAttributes.None, "__result");
 
-    private static bool ShouldSuppressInstance(object instance)
-    {
-        try
+        var getAppContextData = typeof(AppContext).GetMethod(
+            nameof(AppContext.GetData),
+            BindingFlags.Static | BindingFlags.Public,
+            binder: null,
+            types: [typeof(string)],
+            modifiers: null)
+            ?? throw new MissingMethodException(typeof(AppContext).FullName, nameof(AppContext.GetData));
+
+        var containsAddress = typeof(HashSet<nint>).GetMethod(
+            nameof(HashSet<nint>.Contains),
+            BindingFlags.Instance | BindingFlags.Public,
+            binder: null,
+            types: [typeof(nint)],
+            modifiers: null)
+            ?? throw new MissingMethodException(typeof(HashSet<nint>).FullName, nameof(HashSet<nint>.Contains));
+
+        var incrementCounter = typeof(Interlocked).GetMethod(
+            nameof(Interlocked.Increment),
+            BindingFlags.Static | BindingFlags.Public,
+            binder: null,
+            types: [typeof(int).MakeByRefType()],
+            modifiers: null)
+            ?? throw new MissingMethodException(typeof(Interlocked).FullName, nameof(Interlocked.Increment));
+
+        var completedTaskGetter = returnsTask
+            ? typeof(Task).GetProperty(nameof(Task.CompletedTask), BindingFlags.Static | BindingFlags.Public)?.GetMethod
+                ?? throw new MissingMethodException(typeof(Task).FullName, $"get_{nameof(Task.CompletedTask)}")
+            : null;
+
+        var il = prefix.GetILGenerator();
+        var address = il.DeclareLocal(typeof(nint));
+        var ownedAddresses = il.DeclareLocal(typeof(HashSet<nint>));
+        var counter = il.DeclareLocal(typeof(int[]));
+        var prefixResult = il.DeclareLocal(typeof(bool));
+        var allowOriginal = il.DefineLabel();
+        var returnResult = il.DefineLabel();
+
+        il.BeginExceptionBlock();
+
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Castclass, pairHandlerType);
+        il.Emit(OpCodes.Callvirt, getter);
+        il.Emit(OpCodes.Stloc, address);
+        il.Emit(OpCodes.Ldloc, address);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Conv_I);
+        il.Emit(OpCodes.Beq, allowOriginal);
+
+        il.Emit(OpCodes.Ldstr, OwnershipDataKey);
+        il.Emit(OpCodes.Call, getAppContextData);
+        il.Emit(OpCodes.Isinst, typeof(HashSet<nint>));
+        il.Emit(OpCodes.Stloc, ownedAddresses);
+        il.Emit(OpCodes.Ldloc, ownedAddresses);
+        il.Emit(OpCodes.Brfalse, allowOriginal);
+        il.Emit(OpCodes.Ldloc, ownedAddresses);
+        il.Emit(OpCodes.Ldloc, address);
+        il.Emit(OpCodes.Callvirt, containsAddress);
+        il.Emit(OpCodes.Brfalse, allowOriginal);
+
+        il.Emit(OpCodes.Ldstr, CounterDataKey);
+        il.Emit(OpCodes.Call, getAppContextData);
+        il.Emit(OpCodes.Isinst, typeof(int[]));
+        il.Emit(OpCodes.Stloc, counter);
+        il.Emit(OpCodes.Ldloc, counter);
+        il.Emit(OpCodes.Brfalse, allowOriginal);
+
+        if (returnsTask)
         {
-            var instanceType = instance.GetType();
-            PropertyInfo? property;
-
-            lock (PropertyLock)
-                PlayerCharacterProperties.TryGetValue(instanceType, out property);
-
-            property ??= instanceType.GetProperty(
-                "PlayerCharacter",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-
-            if (property?.GetValue(instance) is not IntPtr address || address == IntPtr.Zero)
-                return false;
-
-            return IsPlayerSyncOwned(address);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, completedTaskGetter!);
+            il.Emit(OpCodes.Stind_Ref);
         }
-        catch
-        {
-            // Fail open: if Lightless changes, let it continue normally.
-            return false;
-        }
+
+        il.Emit(OpCodes.Ldloc, counter);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Ldelema, typeof(int));
+        il.Emit(OpCodes.Call, incrementCounter);
+        il.Emit(OpCodes.Pop);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Stloc, prefixResult);
+        il.Emit(OpCodes.Leave, returnResult);
+
+        il.MarkLabel(allowOriginal);
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Stloc, prefixResult);
+        il.Emit(OpCodes.Leave, returnResult);
+
+        il.BeginCatchBlock(typeof(Exception));
+        il.Emit(OpCodes.Pop);
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Stloc, prefixResult);
+        il.Emit(OpCodes.Leave, returnResult);
+        il.EndExceptionBlock();
+
+        il.MarkLabel(returnResult);
+        il.Emit(OpCodes.Ldloc, prefixResult);
+        il.Emit(OpCodes.Ret);
+
+        return prefix;
     }
 
     private static bool IsPlayerSyncOwned(nint gameObjectAddress)
@@ -345,32 +509,41 @@ internal sealed class LightlessSuppressor : IDisposable
             return;
 
         disposed = true;
+        var unpatchFailed = false;
 
-        try
+        if (harmony != null && harmonyUnpatchMethod != null && prefixFactoryMethod != null)
         {
-            if (harmony != null)
+            foreach (var method in patchedMethods)
             {
-                foreach (var method in patchedMethods)
+                try
                 {
                     using var reflectionScope = AssemblyLoadContext.EnterContextualReflection(method.Module.Assembly);
-                    harmony.Unpatch(method, HarmonyPatchType.All, HarmonyId);
+                    harmonyUnpatchMethod.Invoke(harmony, [method, prefixFactoryMethod]);
+
+                    lock (PrefixFactoryLock)
+                        PrefixFactoryMethods.Remove(method);
+                }
+                catch (Exception ex)
+                {
+                    unpatchFailed = true;
+                    log.Error(ex, "Failed to remove a SyncBridge Harmony patch during shutdown.");
                 }
             }
         }
-        catch (Exception ex)
-        {
-            log.Error(ex, "Failed to remove SyncBridge Harmony patches during shutdown.");
-        }
 
         patchedMethods.Clear();
+        patchPrefixes.Clear();
         diagnosticReason = "disposed";
-
-        lock (PropertyLock)
-            PlayerCharacterProperties.Clear();
 
         lock (OwnershipLock)
             playerSyncOwned.Clear();
 
-        log.Debug("LightlessSuppressor disposed.");
+        AppContext.SetData(OwnershipDataKey, null);
+        AppContext.SetData(CounterDataKey, null);
+
+        if (unpatchFailed)
+            log.Warning("LightlessSuppressor disposed fail-open; one or more patches could not be removed.");
+        else
+            log.Debug("LightlessSuppressor disposed.");
     }
 }
